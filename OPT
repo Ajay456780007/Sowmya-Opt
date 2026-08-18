@@ -1,0 +1,634 @@
+classdef Optimizations
+    properties
+        n_bus; n; busdata; linedata; Pg; Qg; all_dat; min_; max_; sel; max1, max2; nev; ndg;n_approach;nn
+  
+    end
+    methods
+        function [fitval] = fit_fun_SSSC(obj, sol)
+        
+            if size(sol,2) == 1
+                sol = sol';
+            end
+        
+            if mod(length(sol),2) ~= 0
+                error(['Invalid SSSC solution length. ', ...
+                       'Solution must contain [LineNumber CompensationRatio] ', ...
+                       'pairs.']);
+            end
+        
+            LineNo = round(sol(1:2:end));
+        
+            Compensation = sol(2:2:end);
+
+        
+            if obj.n_bus == 14
+        
+                all_data1 = obj.all_dat;
+        
+            elseif obj.n_bus == 30
+        
+                all_data1 = obj.all_dat;
+        
+            else
+        
+                error('SSSC fitness function currently supports IEEE 14 and IEEE 30 bus systems.');
+        
+            end
+        
+        
+            %% ================================================================
+            % NUMBER OF TRANSMISSION LINES
+            % ================================================================
+        
+            NumberOfLines = size(all_data1.branch,1);
+        
+            LineNo = max(1,min(LineNo,NumberOfLines));
+        
+        
+            Compensation = max(-0.80,min(Compensation,0.80));
+        
+        
+            %% ================================================================
+            % APPLY SSSC SERIES COMPENSATION
+            % ================================================================
+        
+            for i = 1:length(LineNo)
+        
+                line_idx = LineNo(i);
+        
+                % Original series reactance
+                X_original = all_data1.branch(line_idx,4);
+        
+                % Avoid zero reactance
+                if abs(X_original) < 1e-12
+                    X_original = 1e-6;
+                end
+        
+                % ------------------------------------------------------------
+                % SSSC equivalent series reactance
+                %
+                % X_new = X_original * (1 - compensation)
+                %
+                % Example:
+                %
+                % Compensation = 0.30
+                % X_new = 0.70 * X_original
+                %
+                % Compensation = -0.30
+                % X_new = 1.30 * X_original
+                % ------------------------------------------------------------
+        
+                X_new = X_original * (1 - Compensation(i));
+        
+                % Prevent zero/negative reactance
+                X_new = max(X_new,0.05*abs(X_original));
+        
+                % Update branch reactance
+                all_data1.branch(line_idx,4) = X_new;
+        
+            end
+        
+        
+            %% ================================================================
+            % RUN POWER FLOW
+            % ================================================================
+        
+            if obj.n_bus == 14 || obj.n_bus == 30
+        
+                [Plosskw, Qlosskw, PL, QL, voltage, angle_all,T_power_loss,AVDI, AVSI, volt_dev, Voltage_min, Voltage_max, Ploss_branch, ...
+                 Qloss_branch, ATC_per_bus, all_cost] = ...
+                    Load_flow_base1( all_data1, obj.n_approach, obj.n_bus, obj.nn);
+        
+            end
+       
+        
+            if isempty(ATC_per_bus)
+                ATC = 0;
+            else
+                ATC = mean(ATC_per_bus,'omitnan');
+            end
+        
+        
+            % Avoid division by zero
+            if isnan(ATC) || isinf(ATC) || ATC <= 0
+                ATC = 1e-6;
+            end
+        
+        
+            if isnan(T_power_loss) || isinf(T_power_loss)
+                T_power_loss = 1e6;
+            end
+        
+        
+            if isnan(AVSI) || isinf(AVSI)
+                AVSI = 1e6;
+            end
+        
+            fitval = (1/ATC) + T_power_loss + (1/AVSI);
+        
+            if obj.n_approach == 1
+                p_loss_cost = T_power_loss * 100
+                e_loss_cost = (T_power_loss * 24 / 1000) * 100;
+                v_stab_cost = AVSI * 100;
+                fitval = p_loss_cost + e_loss_cost + v_stab_cost;  
+            end
+        
+            if obj.n_approach == 2
+                fitval = (1/ATC) + T_power_loss + (1/AVSI);
+            end
+            if isnan(fitval) || isinf(fitval)
+                fitval = 1e10;
+        
+            end
+        
+        end
+        
+        function [fitval]=fit_fun_EV(obj, sol)
+            if size(sol, 2)==1
+               sol=sol'; 
+            end
+            N_bus = round(sol(1:2:end));
+%             N_bus = get_val(N_bus,1,obj.n_bus);
+            n1 = numel(N_bus);
+            C = setxor(N_bus,1:n1);
+            [U, id] = unique(N_bus);
+            ix = setxor(id,1:n1);
+            N_bus(ix) = C(randperm(numel(ix)));
+            in_power = sol(2:2:end);
+            in_power = get_val1(in_power, obj.min_, obj.max_);
+            in_power(in_power==0)=0+rand(1,1)*(obj.max_-0);
+            in_power = (in_power/sum(in_power))*obj.max_;
+            if obj.n_bus ==14 || obj.n_bus==30
+                all_data1=obj.all_dat;
+                for i = 1: size(N_bus, 2)
+                    ff = find(all_data1.bus(:,1)==N_bus(i));
+                    if ff ~= 0
+                        all_data1.bus(ff, 3) =  all_data1.bus(ff, 3) + in_power(i);
+                    end
+                end
+                [Plosskw, Qlosskw, PL, QL, voltage, angle_all, T_power_loss, AVDI, AVSI , all_cost]=Load_flow_base1(all_data1, obj.n_approach, obj.n_bus, obj.nn);
+            end
+            if obj.n_bus ==33 || obj.n_bus == 69
+                busdata_=obj.busdata;
+                for i =1:size(N_bus,2)
+                    busdata_(N_bus(i), 2) = busdata_(N_bus(i), 2)+(in_power(i));
+                end
+                [Plosskw, Qlosskw, PL, QL, voltage, angle_all, T_power_loss, AVDI, AVSI, all_cost]=Load_flow_base(obj.n_bus, busdata_, obj.linedata, obj.Pg, obj.Qg, obj.n_approach, obj.nn);
+            end
+            fitval= T_power_loss+AVDI+(1/AVSI);
+            if obj.n_approach == 1
+%                 p_loss_cost = T_power_loss*100; %% Calaculating Power loss cost
+%                 e_loss_cost = (T_power_loss*24/1000)*100; %%Calculating Energy loss cost for 24hrs
+%                 v_stab_cost = AVSI*100; %% Calculating Voltage stability cost
+%                 fitval = p_loss_cost+e_loss_cost+v_stab_cost;
+            elseif obj.n_approach == 2
+%                 chr_cost = length(N_bus)*100;    %% Charging Cost
+%                 oper_cost = sum(in_power)*100;  %% Operating Cost
+%                 ins_cost = length(N_bus)*500; %% Installation Cost
+%                 Main_cost = length(N_bus)*500; %% Maintance Cost
+%                 fitval = chr_cost+oper_cost+ins_cost+Main_cost;
+            end
+
+        end
+        
+
+        function [fitval]=fit_fun_EV_DG(obj, sol)
+            if size(sol, 2)==1
+               sol=sol'; 
+            end
+            N_bus = round(sol(1:2:end));
+            N_bus = get_val(N_bus, 1, obj.n_bus);
+%             n1 = numel(N_bus);
+%             C = setxor(N_bus,1:n1);
+%             [U, id] = unique(N_bus);
+%             ix = setxor(id,1:n1);
+%             N_bus(ix) = C(randperm(numel(ix)));
+            N_bus1=N_bus(1:obj.ndg);
+            N_bus2=N_bus(obj.ndg+1:end);
+            in_power = sol(2:2:end);
+            in_power1=in_power(1:obj.ndg);
+            in_power2=in_power(obj.ndg+1:end);
+            in_power1 = get_val1(in_power1, obj.min_, obj.max1);
+            in_power2 = get_val1(in_power2, obj.min_, obj.max2);
+%             in_power1(in_power1==0)=0+rand(1,1)*(obj.max1-0);
+%             in_power1 = (in_power1/sum(in_power1))*obj.max1;
+%             in_power2(in_power2==0)=0+rand(1,1)*(obj.max2-0);
+%             in_power2 = (in_power2/sum(in_power2))*obj.max2;
+            if obj.n_bus == 14 || obj.n_bus==30
+                all_data1=obj.all_dat;
+                for i = 1: size(N_bus1, 1)
+                    ff = find(all_data1.bus(:,1)==N_bus1(i));
+                    if ff ~= 0
+                        all_data1.bus(ff, 3) =  all_data1.bus(ff, 3) + in_power1(i);
+                    end
+                end
+            end
+            if obj.n_bus == 14 || obj.n_bus==30
+                for i = 1: size(N_bus2, 2)
+                    ff = find(all_data1.gen(:,1)==N_bus2(i));
+                    if ff ~= 0
+                        all_data1.gen(ff, 2) =  all_data1.gen(ff, 2) + in_power2(i);
+                    end
+                end
+                [Plosskw, Qlosskw, PL, QL, voltage, angle_all, T_power_loss, AVDI, AVSI, all_cost]=Load_flow_base1(all_data1, obj.n_approach,obj.n_bus, obj.nn);
+            end
+            if obj.n_bus ==33|| obj.n_bus ==69
+            busdata_=obj.busdata;
+                Pg1=obj.Pg;
+                for i =1:size(N_bus1, 1)
+                    busdata_(N_bus1(i), 2) = busdata_(N_bus1(i), 2)+(in_power1(i));
+                end
+                for i =size(N_bus2, 1)
+                     Pg1(N_bus2(i)) = Pg1(N_bus2(i))+(in_power2(i));
+                end
+                [Plosskw, Qlosskw, PL, QL, voltage, angle_all, T_power_loss, AVDI, AVSI, all_cost]=Load_flow_base(obj.n_bus, busdata_, obj.linedata, Pg1, obj.Qg, obj.n_approach, obj.nn);
+            end
+            fitval= T_power_loss+AVDI+(1/AVSI);
+            if obj.n_approach == 1
+                p_loss_cost = T_power_loss*100; %% Calaculating Power loss cost
+                e_loss_cost = (T_power_loss*24/1000)*100; %%Calculating Energy loss cost for 24hrs
+                v_stab_cost = AVSI*100; %% Calculating Voltage stability cost
+                fitval = p_loss_cost+e_loss_cost+v_stab_cost;
+            elseif obj.n_approach == 2
+%                 chr_cost = 0;    %% Charging Cost
+%                 oper_cost = sum(in_power)*100;  %% Operating Cost
+%                 ins_cost = length(N_bus)*500; % Installation C%ost
+%                 Main_cost = length(N_bus)*500; %% Maintance Cost
+%                 fitval = chr_cost+oper_cost+ins_cost+Main_cost;
+            end
+        end
+        
+        
+        function [out]=print_output1(obj, Plosskw, Qlosskw, PL, QL, voltage, angle_all, T_power_loss, AVDI, AVSI, N_bus1, N_bus2, in_power1, in_power2, all_cost)
+            out.Ploss=Plosskw; out.Qloss=Qlosskw; out.PL = PL; out.QL= QL; out.voltage=voltage; out.angle_all=angle_all;
+            out.T_power_loss = T_power_loss; out.AVDI=AVDI; out.AVSI=AVSI; out.best_dg_pos = N_bus1; 
+            out.best_dg_pow=in_power1;out.best_ev_pos = N_bus2; out.best_ev_pow=in_power2;
+            if obj.n_approach ==1
+                 out.p_loss_cost=all_cost.p_loss_cost; out.e_loss_cost=all_cost.e_loss_cost; out.v_stab_cost=all_cost.v_stab_cost;
+            elseif obj.n_approach==2
+                out.chr_cost = all_cost.chr_cost; out.oper_cost = all_cost.oper_cost;
+                out.ins_cost = all_cost.ins_cost; out.Main_cost = all_cost.Main_cost;
+            end
+            if obj.n_bus==118 st="(in MW : )"; else  st="(in kW : )"; end
+            disp('==============================================')
+            disp(join(['Best Position for UPFC : ', st, num2str(N_bus1)]))
+            disp(join(['Best Power for UPFC  ', st, num2str(in_power1)]))
+            disp('==============================================')
+              disp('==============================================')
+            disp(join(['Best Position for EV : ', st, num2str(N_bus2)]))
+            disp(join(['Best Power for EV  ', st, num2str(in_power2)]))
+            disp('==============================================')
+        end
+
+        function [out]=print_output(obj, Plosskw, Qlosskw, PL, QL, voltage, angle_all, T_power_loss, AVDI, AVSI, best_pos, best_pow,all_cost, ...
+                              Voltage_dev, Voltage_min, Voltage_max, Ploss_branch, Qloss_branch, ATC_per_bus, trans_efficiency, temp_uncertainty)
+             if obj.sel==1
+                out.Ploss = Plosskw;
+                out.Qloss = Qlosskw;
+                out.PL = PL;
+                out.QL = QL;
+                out.voltage = voltage;
+                out.angle_all = angle_all;
+                out.T_power_loss = T_power_loss;
+                out.AVDI = AVDI;
+                out.AVSI = AVSI;
+                out.best_dg_pos = best_pos;
+                out.best_dg_pow = best_pow;
+                out.Voltage_dev = Voltage_dev;
+                out.Voltage_min = Voltage_min;
+                out.Voltage_max = Voltage_max;
+                out.Ploss_branch = Ploss_branch;
+                out.Qloss_branch = Qloss_branch;
+                out.ATC_per_bus = ATC_per_bus;
+                out.trans_efficiency = trans_efficiency;
+                out.temp_uncertainty = temp_uncertainty;
+    
+                % if obj.n_approach ==1
+                %     out.p_loss_cost=all_cost.p_loss_cost; out.e_loss_cost=all_cost.e_loss_cost; out.v_stab_cost=all_cost.v_stab_cost;
+                % elseif obj.n_approach==2
+                %     out.chr_cost = all_cost.chr_cost; out.oper_cost = all_cost.oper_cost;
+                %     out.ins_cost = all_cost.ins_cost; out.Main_cost = all_cost.Main_cost;
+                % end
+            if obj.n_bus==14 || obj.n_bus==30 st="(in kW : )"; else  st="(in kW : )"; end
+                disp('==============================================')
+                disp(join(['Best Position for UPFC : ', st, num2str(best_pos)]))
+                disp(join(['Best Power for UPFC  ', st, num2str(best_pow)]))
+                disp('==============================================')
+            elseif obj.sel==2 || obj.sel==4
+                out.Ploss=Plosskw; out.Qloss=Qlosskw; out.PL = PL; out.QL= QL; out.voltage=voltage; out.angle_all=angle_all;
+                out.T_power_loss = T_power_loss; out.AVDI=AVDI; out.AVSI=AVSI;out.best_ev_pos = best_pos; out.best_ev_pow=best_pow;  
+                 if obj.n_bus==118 st="(in MW : )"; else  st="(in kW : )"; end
+                disp('==============================================')
+                disp(join(['Best Position for EV : ', st, num2str(best_pos)]))
+                disp(join(['Best Power for EV  ', st, num2str(best_pow)]))
+                disp('==============================================')
+                if obj.n_approach ==1
+                    out.p_loss_cost=all_cost.p_loss_cost; out.e_loss_cost=all_cost.e_loss_cost; out.v_stab_cost=all_cost.v_stab_cost;
+                elseif obj.n_approach==2
+                    out.chr_cost = all_cost.chr_cost; out.oper_cost = all_cost.oper_cost;
+                    out.ins_cost = all_cost.ins_cost; out.Main_cost = all_cost.Main_cost;
+                end
+            end
+        end
+        
+        function [out]=Calc_powerflow(obj, best_pos, best_pow)
+            best_pos = round(best_pos);
+            if size(best_pos, 2) ==1
+                best_pos = best_pos';
+                best_pow= best_pow';
+            end
+            if obj.sel==1                    
+%                  best_pos= get_val(best_pos, 1, obj.n_bus);
+                n1 = numel(best_pos);
+                C = setxor(best_pos,1:n1);
+                [U, id] = unique(best_pos);
+                ix = setxor(id,1:n1);
+                best_pos(ix) = C(randperm(numel(ix)));
+                best_pow = get_val1(best_pow, obj.min_, obj.max_);
+%                 best_pow(best_pow==0)=0+rand(1,1)*(obj.max_-0);
+%                 best_pow = (best_pow/sum(best_pow))*obj.max_;
+                if obj.n_bus == 14 || obj.n_bus==30
+                    all_data1=obj.all_dat;
+                    for i = 1: size(best_pos, 2)
+                        ff = find(all_data1.gen(:,1)==best_pos(i));
+                        if ff ~= 0
+                           all_data1.gen(ff, 2) =  all_data1.gen(ff, 2) + best_pow(i);
+                        end
+                    end
+                 [Plosskw, Qlosskw, PL, QL, voltage, angle_all, T_power_loss, AVDI, AVSI,Voltage_dev, Voltage_min, Voltage_max, Ploss_branch, Qloss_branch, ATC_per_bus, all_cost, ...
+          trans_efficiency, temp_uncertainty ]=Load_flow_base1(all_data1, obj.n_approach, obj.n_bus, obj.nn);
+                end
+                if obj.n_bus==33 || obj.n_bus==69
+                    Pg1=obj.Pg;
+                    for i =1:size(best_pos,2)
+                        Pg1(best_pos(i)) = Pg1(best_pos(i))+(best_pow(i));
+                    end
+                    [Plosskw, Qlosskw, PL, QL, voltage, angle_all, T_power_loss, AVDI, AVSI, all_cost]=Load_flow_base(obj.n_bus, obj.busdata, obj.linedata,Pg1, obj.Qg, obj.n_approach, obj.nn);
+                end
+            end
+            if obj.sel==2
+%                 n1 = numel(best_pos);
+                best_pos = get_val(best_pos,1,obj.n_bus);
+%                 C = setxor(best_pos,1:n1);
+%                 [U, id] = unique(best_pos);
+%                 ix = setxor(id,1:n1);
+%                 best_pos(ix) = C(randperm(numel(ix)));
+                best_pow = get_val1(best_pow, obj.min_, obj.max_);
+%                 best_pow(best_pow==0)=0+rand(1,1)*(obj.max_-0);
+%                 best_pow = (best_pow/sum(best_pow))*obj.max_;
+                if obj.n_bus == 14 || obj.n_bus==30
+                    all_data1=obj.all_dat;
+                    for i = 1: size(best_pos, 2)
+                        ff = find(all_data1.bus(:,1)==best_pos(i));
+                        if ff ~= 0
+                            all_data1.bus(ff, 3) =  all_data1.bus(ff, 3) + best_pow(i);
+                        end
+                    end
+                    [Plosskw, Qlosskw, PL, QL, voltage, angle_all, T_power_loss, AVDI, AVSI, Voltage_dev, Voltage_min, Voltage_max, Ploss_branch, Qloss_branch, ATC_per_bus, all_cost, ...
+          trans_efficiency, temp_uncertainty ]=Load_flow_base1(all_data1, obj.n_approach, obj.n_bus, obj.nn);
+                    disp("")
+                end
+                
+                if obj.n_bus ==33 || obj.n_bus == 69
+                    busdata_=obj.busdata;
+                    for i =1:size(best_pos,2)
+                        busdata_(best_pos(i), 2) = busdata_(best_pos(i), 2)+(best_pow(i));
+                    end
+                    [Plosskw, Qlosskw, PL, QL, voltage, angle_all, T_power_loss, AVDI, AVSI, Voltage_dev, Voltage_min, Voltage_max, Ploss_branch, Qloss_branch, ATC_per_bus, all_cost, ...
+          trans_efficiency, temp_uncertainty]=Load_flow_base(obj.n_bus, busdata_, obj.linedata, obj.Pg, obj.Qg, obj.n_approach, obj.nn);
+                end
+            end
+            if obj.sel==4
+                n1 = numel(best_pos);
+                C = setxor(best_pos,1:n1);
+                [U, id] = unique(best_pos);
+                ix = setxor(id,1:n1);
+                best_pos(ix) = C(randperm(numel(ix)));
+                best_pow(best_pow==0)=0+rand(1,1)*(obj.max_-0);
+                best_pow = (best_pow/sum(best_pow))*obj.max_;
+                if obj.n_bus == 14 || obj.n_bus==30
+                    all_data1=obj.all_dat;
+                    for i = 1: size(best_pos, 2)
+                        ff = find(all_data1.bus(:,1)==best_pos(i));
+                        if ff ~= 0
+                            all_data1.bus(ff, 3) =  all_data1.bus(ff, 3) + best_pow(i);
+                        end
+                    end
+                    [Plosskw, Qlosskw, PL, QL, voltage, angle_all, T_power_loss, AVDI, AVSI, Voltage_dev, Voltage_min, Voltage_max, Ploss_branch, Qloss_branch, ATC_per_bus, all_cost, ...
+          trans_efficiency, temp_uncertainty]=Load_flow_base1(all_data1, obj.n_approach, obj.n_bus, obj.nn);
+                end
+                
+                if obj.n_bus ==33 || obj.n_bus == 69
+                    busdata_=obj.busdata;
+                    for i =1:size(best_pos,2)
+                        busdata_(best_pos(i), 2) = busdata_(best_pos(i), 2)+(best_pow(i));
+                    end
+                    [Plosskw, Qlosskw, PL, QL, voltage, angle_all, T_power_loss, AVDI, AVSI, all_cost]=Load_flow_base(obj.n_bus, busdata_, obj.linedata, obj.Pg, obj.Qg, obj.n_approach, obj.nn);
+                end
+            end
+            if obj.sel==3
+                N_bus = best_pos;
+                N_bus = get_val(N_bus, 1, obj.n_bus);
+%                 n1 = numel(N_bus);
+%                 C = setxor(N_bus,1:n1);
+%                 [U, id] = unique(N_bus);
+%                 ix = setxor(id,1:n1);
+%                 N_bus(ix) = C(randperm(numel(ix)));
+                N_bus1=N_bus(1:obj.ndg);
+                N_bus2=N_bus(obj.ndg+1:end); 
+                in_power = best_pow;
+                in_power1=in_power(1:obj.ndg);
+                in_power2=in_power(obj.ndg+1:obj.ndg+obj.nev);
+                in_power1 = get_val1(in_power1, obj.min_, obj.max1);
+                in_power2 = get_val1(in_power2, obj.min_, obj.max2);
+
+%                 in_power1(in_power1==0)=0+rand(1,1)*(obj.max1-0);
+%                 in_power1 = (in_power1/sum(in_power1))*obj.max1;
+%                 in_power2(in_power2==0)=0+rand(1,1)*(obj.max2-0);
+%                 in_power2 = (in_power2/sum(in_power2))*obj.max2;
+                if obj.n_bus == 14 || obj.n_bus==30
+                    all_data1=obj.all_dat;
+                    for i = 1: size(N_bus1, 1)
+                        ff = find(all_data1.bus(:,1)==N_bus1(i));
+                        if ff ~= 0
+                            all_data1.bus(ff, 3) =  all_data1.bus(ff, 3) + in_power1(i);
+                        end
+                    end
+                end
+                if obj.n_bus == 14 || obj.n_bus==30
+                    for i = 1:  size(in_power2, 2)
+                        ff = find(all_data1.gen(:,1)==N_bus2(i));
+                        if ff ~= 0
+                            all_data1.gen(ff, 2) =  all_data1.gen(ff, 2) + in_power2(i);
+                        end
+                    end
+                    [Plosskw, Qlosskw, PL, QL, voltage, angle_all, T_power_loss, AVDI, AVSI, Voltage_dev, Voltage_min, Voltage_max, Ploss_branch, Qloss_branch, ATC_per_bus, all_cost, ...
+                    trans_efficiency, temp_uncertainty]=Load_flow_base1(all_data1, obj.n_approach, obj.n_bus, obj.nn);
+                end
+                 if obj.n_bus ==33|| obj.n_bus ==69
+                    busdata_=obj.busdata;
+                    Pg1=obj.Pg;
+                    for i =1:size(N_bus1, 1)
+                        busdata_(N_bus1(i), 2) = busdata_(N_bus1(i), 2)+(in_power1(i));
+                    end
+                    for i =size(N_bus2, 1)
+                         Pg1(N_bus2(i)) = Pg1(N_bus2(i))+(in_power2(i));
+                    end
+                    [Plosskw, Qlosskw, PL, QL, voltage, angle_all, T_power_loss, AVDI, AVSI, all_cost]=Load_flow_base(obj.n_bus, busdata_, obj.linedata, Pg1, obj.Qg, obj.n_approach, obj.nn);
+                end
+            end
+          if obj.sel==3
+            out=obj.print_output1(Plosskw, Qlosskw, PL, QL, voltage, angle_all, T_power_loss, AVDI, AVSI, N_bus1, N_bus2, in_power1, in_power2, all_cost);
+          else
+            out=obj.print_output(Plosskw, Qlosskw, PL, QL, voltage, angle_all, T_power_loss, AVDI, AVSI, best_pos, best_pow, all_cost, ...
+                              Voltage_dev, Voltage_min, Voltage_max, Ploss_branch, Qloss_branch, ATC_per_bus, trans_efficiency, temp_uncertainty);
+          end
+        end
+
+        
+        function [xLow, xUpp, fitfun, SearchAgents_no, Max_iteration,dim ]=init(obj)
+         xLow = repmat([1; obj.min_], obj.n, 1); % lower bound on the search space
+         xUpp = repmat([obj.n_bus; obj.max_], obj.n, 1); % upper bound on the search space
+         if obj.sel==1
+            fitfun=@(x)(obj.fit_fun_SSSC(x));
+         elseif obj.sel==2
+            fitfun=@(x)(obj.fit_fun_EV(x));
+         elseif obj.sel==3
+            fitfun=@(x)(obj.fit_fun_EV_DG(x));
+         end
+         SearchAgents_no=obj.n*100; % Number of search agents
+         Max_iteration=100; % Maximum numbef of iterations
+         dim = 2*obj.n;
+
+        end
+        
+        function [out]=base_case(obj)
+            if obj.n_bus==14 
+                [Plosskw, Qlosskw, PL, QL, voltage, angle_all, T_power_loss, AVDI, AVSI, Voltage_dev, Voltage_min, Voltage_max, Ploss_branch, Qloss_branch, ATC_per_bus, all_cost, ...
+          trans_efficiency, temp_uncertainty ]=Load_flow_base1(obj.all_dat, obj.n_approach, obj.n_bus, obj.nn);
+            end
+            if obj.n_bus==30 
+                [Plosskw, Qlosskw, PL, QL, voltage, angle_all, T_power_loss, AVDI, AVSI, Voltage_dev, Voltage_min, Voltage_max, Ploss_branch, Qloss_branch, ATC_per_bus, all_cost, ...
+          trans_efficiency, temp_uncertainty ]=Load_flow_base1(obj.all_dat, obj.n_approach, obj.n_bus, obj.nn);
+            end
+            if obj.sel==3
+                N_bus1=zeros(1,obj.ndg); N_bus2=zeros(1,obj.nev); in_power1=zeros(1,obj.ndg); in_power2=zeros(1,obj.nev);
+                out = obj.print_output1(Plosskw, Qlosskw, PL, QL, voltage, angle_all, T_power_loss, AVDI, AVSI,N_bus1, N_bus2, in_power1, in_power2, all_cost);
+            else
+                Best_pos = zeros(1,obj.n);   B_i_P=zeros(1,obj.n);
+                out = obj.print_output(Plosskw, Qlosskw, PL, QL, voltage, angle_all, T_power_loss, AVDI, AVSI, Best_pos, B_i_P, all_cost, ...
+                              Voltage_dev, Voltage_min, Voltage_max, Ploss_branch, Qloss_branch, ATC_per_bus, trans_efficiency, temp_uncertainty);
+            end               
+        end
+
+        function [out]=test_pso(obj)
+             n1=obj.n*2;
+             [lb, ub, fit, pop, epoch, dim]= obj.init();
+            objFun = fit;
+            x0 = [];  % No initial guess
+            
+            options.alpha = 0.4;  % weight on current search direction
+            options.beta = 0.9;   % weight on local best search direction
+            options.gamma = 0.9;  % weight on global best search direction
+            
+            options.nPopulation = n1;
+            options.maxIter = 100;
+           
+            [xBest, fBest, info, dataLog] = PSO(objFun, x0, lb, ub, options);
+            Best_pos =  xBest(1:2:end);
+            B_i_P = xBest(2:2:end);
+            out=obj.Calc_powerflow(Best_pos,B_i_P);
+
+        end
+        
+        function [out]=test_goa(obj)
+            [lb, ub, fit, pop, epoch, dim1] = obj.init();
+            SearchAgents_no=pop; % Number of search agents
+            Max_iteration=epoch; % Maximum numbef of iterations
+            dim = dim1;
+            fobj=fit;
+            [Best_score1,Best_pos1,GWO_cg_curve1]=EGWO(SearchAgents_no,Max_iteration,lb,ub,dim,fobj);
+            GWO_cg_curve1;Best_score1;
+            Best_pos =  Best_pos1(1:2:end);
+            B_i_P = Best_pos1(2:2:end);
+            out=obj.Calc_powerflow(Best_pos,B_i_P);
+        end
+        
+        function [out]=test_EGWO(obj)
+            [lb, ub, fit, pop, epoch, dim1] = obj.init();
+            SearchAgents_no=pop; % Number of search agents
+            Max_iteration=epoch; % Maximum numbef of iterations
+            dim = dim1;
+            fobj=fit;
+            [Best_score1,Best_pos1,GWO_cg_curve1]=EGWO(SearchAgents_no,Max_iteration,lb,ub,dim,fobj);
+            Best_pos =  Best_pos1(1:2:end);
+            B_i_P = Best_pos1(2:2:end);
+            out=obj.Calc_powerflow(Best_pos,B_i_P);
+        end
+        
+        function [out]=test_gwo(obj)
+            [lb, ub, fit, pop, epoch, dim1] = obj.init();
+            SearchAgents_no=pop; % Number of search agents
+            Max_iteration=epoch; % Maximum numbef of iterations
+            dim=dim1;
+            fobj=fit;
+            [Best_score1,Best_pos1,GWO_cg_curve1]=GWO(SearchAgents_no,Max_iteration,lb,ub,dim,fobj);
+            Best_pos =  Best_pos1(1:2:end);
+            B_i_P = Best_pos1(2:2:end);
+            out=obj.Calc_powerflow(Best_pos,B_i_P);
+        end
+        
+        function [out]=test_ffo(obj)
+            [lb, ub, fit, pop, epoch, dim1] = obj.init();
+            lb=lb';ub=ub';
+            SearchAgents_no=pop;
+            Max_iteration=epoch;
+            dim=dim1;
+            fobj=fit;
+            [Target_score,Target_pos]=fa(SearchAgents_no, Max_iteration,lb,ub,dim,fobj);
+            Best_pos =  Target_pos.Position(1:2:end);
+            B_i_P = Target_pos.Position(2:2:end);
+            out=obj.Calc_powerflow(Best_pos,B_i_P);
+        end
+        
+        function [out]=test_MFO(obj)
+            [lb, ub, fit, pop, epoch, dim1] = obj.init();
+            lb=lb';ub=ub';
+            SearchAgents_no=pop;
+            Max_iteration=epoch;
+            dim=dim1;
+            fobj=fit;
+            [Best_score,Best_pos1,cg_curve]=MFO(SearchAgents_no,Max_iteration,lb,ub,dim,fobj);
+            Best_pos =  Best_pos1(1:2:end);
+            B_i_P = Best_pos1(2:2:end);
+            out=obj.Calc_powerflow(Best_pos,B_i_P);
+        end
+
+        function [out]=test_HFFO(obj)
+            [lb, ub, fit, pop, epoch, dim1] = obj.init();
+            lb=lb';ub=ub';
+            SearchAgents_no=pop;
+            Max_iteration=100;
+            dim=dim1;
+            fobj=fit;
+            [Best_score,Best_pos1,cg_curve]=HFFO(SearchAgents_no,Max_iteration,lb,ub,dim,fobj);
+            Best_pos =  Best_pos1(1:2:end);
+            B_i_P = Best_pos1(2:2:end);
+            out=obj.Calc_powerflow(Best_pos,B_i_P);
+        end
+
+        function [out] = test_HLOA(obj)
+            [lb,ub,fit,pop,epoch,dim1] =obj.init();
+            lb=lb'; ub=ub';
+            SearchAgents_no=pop;
+            Max_iteration=100;
+            dim=dim1;
+            fobj=fit;
+            [Best_score,Best_pos1,cg_curve]=HLOA(SearchAgents_no,Max_iteration,lb,ub,dim,fobj);
+            Best_pos =  Best_pos1(1:2:end);
+            B_i_P = Best_pos1(2:2:end);
+            out=obj.Calc_powerflow(Best_pos,B_i_P);
+        end
+    end
+end
+
